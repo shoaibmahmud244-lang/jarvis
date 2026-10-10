@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+SCRIPT="$(readlink -f "$0")"
+RUNTIME_BASE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+RUNTIME_DIR="$RUNTIME_BASE/jarvis"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/jarvis"
+HISTORY_FILE="$DATA_DIR/conversation.txt"
+MODEL="openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+
+mkdir -p "$RUNTIME_DIR" "$DATA_DIR"
+chmod 700 "$RUNTIME_DIR" "$DATA_DIR"
+if [[ -s "$RUNTIME_DIR/conversation.txt" && ! -s "$HISTORY_FILE" ]]; then
+  mv -f "$RUNTIME_DIR/conversation.txt" "$HISTORY_FILE"
+fi
+touch "$HISTORY_FILE"
+chmod 600 "$HISTORY_FILE"
+
+notify() {
+  notify-send --app-name="Jarvis" --urgency=low "$1" "${2:-}" >/dev/null 2>&1 || true
+}
+
+read_pid() {
+  local file="$1" pid=""
+  [[ -r "$file" ]] && read -r pid < "$file" || true
+  if [[ "$pid" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$pid"
+  fi
+  return 0
+}
+
+capture_frame() {
+  local destination="$1" tmp focused_monitor=""
+  tmp="${destination%.jpg}.tmp.jpg"
+  focused_monitor="$(hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused) | .name' 2>/dev/null || true)"
+  local -a grim_cmd=(grim)
+  if [[ -n "$focused_monitor" ]]; then
+    grim_cmd+=(-o "$focused_monitor")
+  fi
+  grim_cmd+=(-)
+  if "${grim_cmd[@]}" | ffmpeg -hide_banner -loglevel error -f png_pipe -i pipe:0 \
+      -vf 'scale=w=min(1920\,iw):h=min(1080\,ih):force_original_aspect_ratio=decrease:force_divisible_by=2' \
+      -frames:v 1 -q:v 5 -update 1 -y "$tmp"; then
+    mv -f "$tmp" "$destination"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+stop_screen_loop() {
+  local pid
+  pid="$(read_pid "$RUNTIME_DIR/screen-capture.pid")"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+  fi
+  rm -f "$RUNTIME_DIR/screen-capture.pid"
+}
+
+screen_hold_loop() {
+  local directory="$1" sleep_pid=""
+  trap '
+    if [[ -n "$sleep_pid" ]]; then
+      kill "$sleep_pid" 2>/dev/null || true
+      wait "$sleep_pid" 2>/dev/null || true
+    fi
+    exit 0
+  ' TERM INT HUP
+  while [[ -e "$RUNTIME_DIR/ptt.active" && -e "$RUNTIME_DIR/screen-down.active" && -d "$directory" ]]; do
+    sleep 3 &
+    sleep_pid=$!
+    wait "$sleep_pid" || true
+    sleep_pid=""
+    [[ -e "$RUNTIME_DIR/ptt.active" && -e "$RUNTIME_DIR/screen-down.active" && -d "$directory" ]] || break
+    local count
+    count="$(find "$directory" -maxdepth 1 -type f -name 'frame-*.jpg' 2>/dev/null | wc -l)"
+    local next_index=$((count + 1))
+    local next_frame
+    printf -v next_frame '%s/frame-%03d.jpg' "$directory" "$next_index"
+    capture_frame "$next_frame" || true
+  done
+}
+
+screen_down() {
+  [[ -e "$RUNTIME_DIR/ptt.active" ]] || return 0
+  local framesdir=""
+  [[ -r "$RUNTIME_DIR/current-framesdir" ]] && read -r framesdir < "$RUNTIME_DIR/current-framesdir" || true
+  if [[ -z "$framesdir" || ! -d "$framesdir" ]]; then
+    framesdir="$RUNTIME_DIR/frames.$$"
+    mkdir -m 700 "$framesdir" 2>/dev/null || true
+    printf '%s\n' "$framesdir" > "$RUNTIME_DIR/current-framesdir"
+  fi
+
+  [[ -e "$RUNTIME_DIR/screen-down.active" ]] && return 0
+  touch "$RUNTIME_DIR/screen-down.active"
+
+  local count
+  count="$(find "$framesdir" -maxdepth 1 -type f -name 'frame-*.jpg' 2>/dev/null | wc -l)"
+  local next_index=$((count + 1))
+  local initial_frame
+  printf -v initial_frame '%s/frame-%03d.jpg' "$framesdir" "$next_index"
+  if capture_frame "$initial_frame"; then
+    notify "Jarvis screen captured" "Screenshot attached to question."
+  fi
+
+  stop_screen_loop
+  screen_hold_loop "$framesdir" >/dev/null 2>&1 &
+  printf '%s\n' "$!" > "$RUNTIME_DIR/screen-capture.pid"
+}
+
+screen_up() {
+  rm -f "$RUNTIME_DIR/screen-down.active"
+  stop_screen_loop
+}
+
+clear_ptt_frames() {
+  local directory=""
+  stop_screen_loop
+  rm -f "$RUNTIME_DIR/screen-down.active"
+  [[ -r "$RUNTIME_DIR/current-framesdir" ]] && read -r directory < "$RUNTIME_DIR/current-framesdir" || true
+  [[ -n "$directory" && "$directory" == "$RUNTIME_DIR"/frames.* ]] && rm -rf -- "$directory"
+  rm -f "$RUNTIME_DIR/current-framesdir"
+}
+
+share_on() {
+  touch "$RUNTIME_DIR/share.enabled"
+}
+
+share_toggle() {
+  if [[ -e "$RUNTIME_DIR/share.enabled" ]]; then
+    rm -f "$RUNTIME_DIR/share.enabled"
+  else
+    share_on
+  fi
+}
+
+voxtype_running() {
+  local status
+  status="$(voxtype status 2>/dev/null)" || return 1
+  case "${status,,}" in
+    *stopped*|*error*|*failed*|*"not running"*) return 1 ;;
+  esac
+  [[ -n "$status" ]]
+}
+
+is_voxtype_process() {
+  local pid="$1" name=""
+  [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/comm" ]] || return 1
+  read -r name < "/proc/$pid/comm" || true
+  [[ "$name" == "voxtype" ]]
+}
+
+start_voxtype_if_needed() {
+  if voxtype_running; then
+    return 0
+  fi
+  if systemctl --user start voxtype.service 2>/dev/null; then
+    for _ in {1..20}; do
+      if voxtype_running; then
+        return 0
+      fi
+      sleep 0.25
+    done
+  fi
+
+  voxtype --on-demand-loading daemon > "$RUNTIME_DIR/voxtype.log" 2>&1 &
+  local pid=$!
+  for _ in {1..20}; do
+    if voxtype_running; then
+      return 0
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+stop_owned_voxtype() {
+  # Keep voxtype daemon alive so normal hotkey dictation (RightCtrl/F9) continues working
+  return 0
+}
+
+voice_on() {
+  [[ -e "$RUNTIME_DIR/voice.enabled" ]] && return 0
+  touch "$RUNTIME_DIR/voice.enabled"
+  if ! start_voxtype_if_needed; then
+    rm -f "$RUNTIME_DIR/voice.enabled"
+    notify "Jarvis voice mode failed" "Voxtype did not start. Check $RUNTIME_DIR/voxtype.log."
+    return 1
+  fi
+  notify "Jarvis voice mode on" "Hold Delete to speak; release to send."
+}
+
+voice_off() {
+  rm -f "$RUNTIME_DIR/voice.enabled"
+  if [[ -e "$RUNTIME_DIR/ptt.active" ]]; then
+    voxtype record cancel >/dev/null 2>&1 || true
+  fi
+  clear_ptt_frames
+  rm -f "$RUNTIME_DIR/ptt.active" "$RUNTIME_DIR/current-transcript"
+  rm -f "$RUNTIME_DIR/conversation.txt" "$RUNTIME_DIR/conversation.tmp"
+
+  notify "Jarvis voice mode off" "Local text history is kept; run 'vc reset' to clear it."
+}
+
+standalone_dictation_down() {
+  if [[ -e "$RUNTIME_DIR/dictation.active" ]] && voxtype_running; then
+    return 0
+  fi
+  rm -f "$RUNTIME_DIR/dictation.active"
+
+  if ! start_voxtype_if_needed; then
+    notify "Dictation could not start" "Check Voxtype daemon."
+    return 1
+  fi
+  if ! voxtype record start; then
+    notify "Dictation could not start" "Check the Voxtype daemon."
+    return 1
+  fi
+  touch "$RUNTIME_DIR/dictation.active"
+}
+
+standalone_dictation_up() {
+  [[ -e "$RUNTIME_DIR/dictation.active" ]] || return 0
+  rm -f "$RUNTIME_DIR/dictation.active"
+  notify "Transcribing" "Your dictation will be inserted when ready."
+  if ! voxtype record stop --wait --timeout 120 > "$RUNTIME_DIR/dictation-stop.log" 2>&1; then
+    notify "Dictation failed" "Check $RUNTIME_DIR/dictation-stop.log."
+    return 1
+  fi
+}
+
+standalone_dictation_toggle() {
+  if [[ -e "$RUNTIME_DIR/dictation.active" ]]; then
+    standalone_dictation_up
+  else
+    standalone_dictation_down
+  fi
+}
+
+ptt_down() {
+  local transcript
+  [[ -e "$RUNTIME_DIR/voice.enabled" ]] || return 0
+  [[ ! -e "$RUNTIME_DIR/ptt.active" ]] || return 0
+  if ! voxtype_running; then
+    notify "Jarvis voice mode unavailable" "Toggle voice mode off and on to restart Voxtype."
+    return 1
+  fi
+
+  transcript="$RUNTIME_DIR/transcript.$$.txt"
+  rm -f "$transcript"
+  if ! voxtype record start --file="$transcript" --no-osd; then
+    notify "Jarvis could not start recording" "Check the Voxtype daemon."
+    return 1
+  fi
+  printf '%s\n' "$transcript" > "$RUNTIME_DIR/current-transcript"
+  touch "$RUNTIME_DIR/ptt.active"
+
+  clear_ptt_frames
+  local framesdir="$RUNTIME_DIR/frames.$$"
+  mkdir -m 700 "$framesdir"
+  printf '%s\n' "$framesdir" > "$RUNTIME_DIR/current-framesdir"
+
+  notify "Listening" "Speak now. Click Print/RightShift for 1 screenshot, or hold for continuous."
+}
+
+ask() {
+  local transcript="$1" question prompt history answer status model_error speech_error history_tmp
+  shift
+  local -a frames=("$@") files=()
+  answer="$RUNTIME_DIR/answer.$$.txt"
+  model_error="$RUNTIME_DIR/model.$$.err"
+  speech_error="$RUNTIME_DIR/speech.$$.err"
+  history_tmp="$DATA_DIR/conversation.tmp.$$"
+  local cleanup_trap cleanup_arg
+  cleanup_request() {
+    local cleanup_transcript="$1" cleanup_answer="$2" cleanup_model_error="$3" cleanup_speech_error="$4" cleanup_history_tmp="$5" frame
+    shift 5
+    rm -f -- "$cleanup_transcript" "$cleanup_answer" "$cleanup_model_error" "$cleanup_speech_error" "$cleanup_history_tmp"
+    for frame in "$@"; do
+      rm -f -- "$frame"
+    done
+    for frame in "$@"; do
+      rmdir -- "$(dirname -- "$frame")" 2>/dev/null || true
+    done
+  }
+  printf -v cleanup_trap 'cleanup_request %q %q %q %q %q' "$transcript" "$answer" "$model_error" "$speech_error" "$history_tmp"
+  for cleanup_arg in "${frames[@]}"; do
+    printf -v cleanup_arg ' %q' "$cleanup_arg"
+    cleanup_trap+="$cleanup_arg"
+  done
+  trap "$cleanup_trap" EXIT
+
+  if [[ ! -s "$transcript" ]]; then
+    notify "Jarvis heard no speech" "Try holding Delete a little longer."
+    return 0
+  fi
+
+  exec 9>"$RUNTIME_DIR/request.lock"
+  if ! flock -n 9; then
+    notify "Jarvis is still answering" "Wait for the current spoken reply before sending another question."
+    return 0
+  fi
+
+  question="$(<"$transcript")"
+  history="$(tail -c 2000 "$HISTORY_FILE" 2>/dev/null || true)"
+  prompt="$(printf '%s\n\nRecent conversation:\n%s\n\nQuestion: %s' \
+    'You are Jarvis, a concise real-time voice assistant. Give immediate, short, high-value answers. If a question can be answered with Yes or No, answer just Yes or No. Never use markdown, bullet points, asterisks, greetings, or conversational filler. Keep spoken replies to 1 or 2 short sentences maximum. If an image is attached, answer directly based on visible screen elements. You have access to persistent memory via Engram tools when user context, preferences, or past recall is needed.' \
+    "$history" "$question")"
+
+  cd "$RUNTIME_DIR"
+  local engram_bin="${ENGRAM_BIN:-$HOME/.local/bin/engram}"
+  local engram_dir="${ENGRAM_DATA_DIR:-$HOME/.engram}"
+  export OPENCODE_CONFIG_CONTENT="{\"\$schema\":\"https://opencode.ai/config.json\",\"mcp\":{\"engram\":{\"type\":\"local\",\"command\":[\"${engram_bin}\",\"mcp\",\"--tools=agent\",\"--project=jarvis\"],\"enabled\":true,\"environment\":{\"ENGRAM_DATA_DIR\":\"${engram_dir}\"}}},\"permission\":{\"engram_*\":\"allow\"}}"
+  local frame
+  for frame in "${frames[@]}"; do
+    [[ -s "$frame" ]] && files+=(--file "$frame")
+  done
+  if timeout --foreground 60s opencode run --agent build --model "$MODEL" --dir "$RUNTIME_DIR" "${files[@]}" -- "$prompt" < /dev/null > "$answer" 2> "$model_error"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  if [[ "$status" == 0 && -s "$answer" ]]; then
+    {
+      printf 'User: %s\nAssistant: ' "$question"
+      cat "$answer"
+      printf '\n\n'
+    } >> "$HISTORY_FILE"
+    tail -c 10000 "$HISTORY_FILE" > "$history_tmp"
+    chmod 600 "$history_tmp"
+    mv -f "$history_tmp" "$HISTORY_FILE"
+    if ! command -v jarvis-speak >/dev/null 2>&1; then
+      notify "Jarvis speech unavailable" "Install local speech with ~/.local/bin/jarvis-tts-setup when online."
+    elif ! jarvis-speak < "$answer" 2> "$speech_error"; then
+      notify "Jarvis speech unavailable" "The answer is saved in local history; check the Kokoro setup and audio output."
+    fi
+  elif [[ "$status" != 0 ]]; then
+    notify "Jarvis could not answer" "The OpenCode request failed. Check network access, then try again."
+  else
+    notify "Jarvis returned no answer" "Try asking again."
+  fi
+  return "$status"
+}
+
+reset_history() {
+  exec 9>"$RUNTIME_DIR/request.lock"
+  flock 9
+  : > "$HISTORY_FILE"
+  chmod 600 "$HISTORY_FILE"
+  notify "Jarvis conversation cleared" "Local text history was removed."
+}
+
+ptt_up() {
+  local transcript="" framesdir=""
+  local -a frames=()
+  [[ -e "$RUNTIME_DIR/ptt.active" ]] || return 0
+  rm -f "$RUNTIME_DIR/ptt.active" "$RUNTIME_DIR/screen-down.active"
+  stop_screen_loop
+
+  [[ -r "$RUNTIME_DIR/current-transcript" ]] && read -r transcript < "$RUNTIME_DIR/current-transcript" || true
+  rm -f "$RUNTIME_DIR/current-transcript"
+  if [[ -z "$transcript" ]]; then
+    clear_ptt_frames
+    return 0
+  fi
+
+  [[ -r "$RUNTIME_DIR/current-framesdir" ]] && read -r framesdir < "$RUNTIME_DIR/current-framesdir" || true
+
+  if ! voxtype record stop --wait --wait-file "$transcript" --json --timeout 120 > "$RUNTIME_DIR/transcription.json" 2> "$RUNTIME_DIR/transcription.err"; then
+    rm -f "$transcript" "$RUNTIME_DIR/transcription.json"
+    clear_ptt_frames
+    notify "Jarvis transcription failed" "Check $RUNTIME_DIR/transcription.err."
+    return 1
+  fi
+
+  if [[ -n "$framesdir" && -d "$framesdir" ]]; then
+    mapfile -t frames < <(find "$framesdir" -maxdepth 1 -type f -name '*.jpg' -size +0c -print | sort)
+    if ((${#frames[@]} == 0)); then
+      rmdir -- "$framesdir" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$RUNTIME_DIR/current-framesdir"
+  rm -f "$RUNTIME_DIR/transcription.json" "$RUNTIME_DIR/transcription.err"
+
+  local frame_count=${#frames[@]}
+  if (( frame_count > 0 )); then
+    notify "Jarvis is thinking" "Analyzing $frame_count screenshot(s) and your question."
+  else
+    notify "Jarvis is thinking" "I'll speak when the answer is ready."
+  fi
+
+  nohup "$SCRIPT" ask "$transcript" "${frames[@]}" </dev/null >/dev/null 2>&1 &
+}
+
+cleanup() {
+  rm -f "$RUNTIME_DIR/share.enabled" "$RUNTIME_DIR/screen-down.active"
+  if [[ -e "$RUNTIME_DIR/dictation.active" ]]; then
+    voxtype record cancel >/dev/null 2>&1 || true
+  fi
+  rm -f "$RUNTIME_DIR/dictation.active"
+  stop_owned_voxtype "$RUNTIME_DIR/dictation-voxtype.pid"
+  clear_ptt_frames
+  voice_off
+  rm -rf "$RUNTIME_DIR"/frames.*
+  rm -f "$RUNTIME_DIR"/transcript.*.txt "$RUNTIME_DIR"/answer.*.txt "$RUNTIME_DIR"/answer.txt "$RUNTIME_DIR"/voxtype.log
+}
+
+case "${1:-}" in
+  # Temporary compatibility for an already-loaded Hyprland binding: this is
+  # Omarchy's ordinary screenshot command, never a Jarvis attachment.
+  capture-once) omarchy-capture-screenshot ;;
+  share-toggle) share_toggle ;;
+  screen-down) screen_down ;;
+  screen-up) screen_up ;;
+  voice-on) voice_on ;;
+  voice-off) voice_off ;;
+  dictation-down) standalone_dictation_down ;;
+  dictation-up) standalone_dictation_up ;;
+  dictation-toggle) standalone_dictation_toggle ;;
+  ptt-down) ptt_down ;;
+  ptt-up) ptt_up ;;
+  ask) shift; ask "$@" ;;
+  reset) reset_history ;;
+  cleanup) cleanup ;;
+  *) printf 'Usage: %s {screen-down|screen-up|share-toggle|voice-on|voice-off|dictation-down|dictation-up|dictation-toggle|ptt-down|ptt-up|ask|reset|cleanup}\n' "$0" >&2; exit 2 ;;
+esac

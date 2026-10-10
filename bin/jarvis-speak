@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/jarvis/tts"
+PYTHON="$DATA_DIR/.venv/bin/python"
+if [[ ! -x "$PYTHON" || ! -s "$DATA_DIR/kokoro-v1.0.int8.onnx" || ! -s "$DATA_DIR/voices-v1.0.bin" ]]; then
+  echo "Jarvis speech is not installed. Run ~/.local/bin/jarvis-tts-setup when online." >&2
+  exit 1
+fi
+exec "$PYTHON" "$DATA_DIR/speak.py"

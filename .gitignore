@@ -1,0 +1,30 @@
+# Python virtual environments & packages
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+
+# Binary models & audio assets (automatically downloaded by jarvis-tts-setup)
+*.onnx
+*.bin
+*.download
+*.wav
+*.mp3
+
+# Runtime state & local conversation logs
+conversation.txt
+conversation.tmp*
+*.pid
+*.lock
+*.err
+*.log
+frames/
+*.jpg
+
+# Editor / IDE artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak*

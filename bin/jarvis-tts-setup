@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/jarvis/tts"
+VENV="$DATA_DIR/.venv"
+PYTHON="${VENV}/bin/python"
+MODEL="$DATA_DIR/kokoro-v1.0.int8.onnx"
+VOICES="$DATA_DIR/voices-v1.0.bin"
+RELEASE="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1"
+
+mkdir -p "$DATA_DIR"
+command -v uv >/dev/null || { echo "Install uv, then rerun jarvis-tts-setup." >&2; exit 1; }
+if [[ ! -x "$PYTHON" ]]; then
+  uv venv --python 3.13 "$VENV"
+fi
+uv pip install --python "$PYTHON" kokoro-onnx
+
+download_asset() {
+  local name="$1" destination="$2"
+  local tmp="${destination}.download"
+  if [[ -s "$destination" ]]; then return 0; fi
+  command -v curl >/dev/null || { echo "Install curl, then rerun jarvis-tts-setup." >&2; exit 1; }
+  echo "Downloading $name to $DATA_DIR"
+  if ! curl --fail --location --retry 2 --output "$tmp" "$RELEASE/$name"; then
+    rm -f "$tmp"
+    echo "Could not download $name. Check your network, then rerun jarvis-tts-setup." >&2
+    exit 1
+  fi
+  mv "$tmp" "$destination"
+}
+
+download_asset kokoro-v1.0.int8.onnx "$MODEL"
+download_asset voices-v1.0.bin "$VOICES"
+"$PYTHON" - "$MODEL" "$VOICES" <<'PY'
+import sys
+from kokoro_onnx import Kokoro
+
+model = Kokoro(sys.argv[1], sys.argv[2])
+voices = model.get_voices()
+if "bm_george" not in voices:
+    raise SystemExit("The downloaded voice pack does not include bm_george.")
+samples, sample_rate = model.create(
+    "Jarvis voice check.", voice="bm_george", speed=1.0, lang="en-gb"
+)
+if len(samples) == 0 or sample_rate <= 0:
+    raise SystemExit("Kokoro did not generate audio.")
+print(f"Kokoro is ready: bm_george, {sample_rate} Hz.")
+PY
