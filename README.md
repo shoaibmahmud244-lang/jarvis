@@ -109,3 +109,6 @@ jarvis/
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+For details on what data Jarvis sends (notably the cloud LLM step) and what
+stays local, see [SECURITY.md](SECURITY.md).
