@@ -13,6 +13,7 @@ A fast, lightweight, and multimodal voice assistant tailored for Linux (Wayland 
 - **High-Fidelity British Voice:** Uses [Kokoro ONNX](https://github.com/thewh1teagle/kokoro-onnx) (`bm_george` voice) on CPU with AVX2. Synthesizes ~10x–15x faster than real-time with zero resident RAM when idle.
 - **Persistent Memory:** Seamless context recall across sessions powered by [Engram](https://github.com) MCP integration.
 - **On-Demand Speech Recognition:** Integrated with [Voxtype](https://voxtype.io) running as a shared systemd user daemon (~18MB idle memory, 0% CPU).
+- **Terminal Status Dashboard:** `jarvis-tui` shows voice mode, push-to-talk, screen capture, Voxtype, request state, model, key source and recent conversation in a live read-only view.
 
 ---
 
@@ -24,9 +25,12 @@ A fast, lightweight, and multimodal voice assistant tailored for Linux (Wayland 
          ▼
 [ vc (Controller) ] ──┬──► [ Voxtype ] (Push-to-talk STT)
                       ├──► [ Grim + FFmpeg ] (On-demand Screen Capture)
-                      ├──► [ OpenCode ] (Nvidia Nemotron reasoning + Engram MCP)
+                      ├──► [ OpenCode ] (Google Gemini reasoning + Engram MCP)
                       └──► [ Kokoro ONNX ] ──► [ FFplay ] (Spoken Response)
 ```
+
+Jarvis inherits your OpenCode MCP servers; only `enola` is disabled because
+Gemini rejects its tool schema.
 
 ---
 
@@ -42,6 +46,7 @@ Ensure the following tools are installed on your Linux system:
 | **Grim** | Wayland screenshot capture | `pacman -S grim` |
 | **FFmpeg** | Image scaling and audio playback | `pacman -S ffmpeg` |
 | **Hyprland** | Window manager & compositor | Standard Wayland setup |
+| **gum** | Status dashboard UI (optional) | `pacman -S gum` |
 
 *(Optional)* **Engram**: For persistent memory recall across conversations.
 
@@ -60,12 +65,15 @@ Ensure the following tools are installed on your Linux system:
    ./install.sh
    ```
    The installer will:
-   - Copy executables (`vc`, `jarvis-speak`, `jarvis-tts-setup`) to `~/.local/bin/`.
+   - Copy executables (`vc`, `jarvis-tui`, `jarvis-speak`, `jarvis-tts-setup`) to `~/.local/bin/`.
    - Copy speech synthesis scripts to `~/.local/share/jarvis/tts/`.
    - Setup and enable the `voxtype.service` systemd user service.
    - Download the Kokoro ONNX model and `bm_george` voice pack via `jarvis-tts-setup`.
 
-3. **Configure Hyprland Keybindings:**
+3. **Configure the Gemini API key:**
+   Export `GOOGLE_GENERATIVE_AI_API_KEY`, or put one key per line in `~/.config/gemini/api-keys` (optional rotation index in `~/.local/state/gemini-key/current`).
+
+4. **Configure Hyprland Keybindings:**
    Merge the bindings from `hypr/bindings.lua` into your Hyprland configuration (e.g. `~/.config/hypr/bindings.lua` or translate them to `hyprland.conf`).
 
 ---
@@ -80,6 +88,7 @@ Ensure the following tools are installed on your Linux system:
 | `Print` or `Right Shift` (Tap) | **Attach Screenshot** | Captures 1 screenshot of focused monitor while holding Delete. |
 | `Print` or `Right Shift` (Hold) | **Stream Screen** | Continuously captures screen every 3s while talking. |
 | `vc reset` | **Clear History** | Clears local conversation context. |
+| `jarvis-tui` | **Status Dashboard** | Live terminal dashboard; `--once` prints a plain snapshot. |
 
 ---
 
@@ -89,6 +98,7 @@ Ensure the following tools are installed on your Linux system:
 jarvis/
 ├── bin/
 │   ├── vc                  # Main push-to-talk, vision & orchestrator script
+│   ├── jarvis-tui          # Read-only terminal status dashboard (bash + gum)
 │   ├── jarvis-speak        # Wrapper for TTS execution
 │   └── jarvis-tts-setup    # Model downloader & virtualenv provisioner
 ├── tts/

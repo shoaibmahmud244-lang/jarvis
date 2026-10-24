@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# jarvis-tui — read-only terminal dashboard for Jarvis (bash + gum)
+set -euo pipefail
+
+RUNTIME_BASE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+RUNTIME_DIR="$RUNTIME_BASE/jarvis"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/jarvis"
+HISTORY_FILE="$DATA_DIR/conversation.txt"
+REFRESH="${JARVIS_TUI_REFRESH:-1}"
+TURNS="${JARVIS_TUI_TURNS:-6}"
+PINK=199
+GREEN=42
+RED=196
+GREY=245
+COLOR=1
+
+die() { printf 'jarvis-tui: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  cat <<'EOF'
+Usage: jarvis-tui [options]
+
+Read-only dashboard for Jarvis: voice mode, push-to-talk, screen capture,
+Voxtype, current request, model, API key source and recent conversation.
+
+Options:
+  --once          print one plain-text snapshot and exit
+  --turns N       conversation turns to show (default: 6)
+  --refresh S     auto-refresh seconds (default: 1)
+  -h, --help      show this help
+
+Keys: q quit · r refresh
+EOF
+}
+
+find_vc() {
+  local c
+  for c in "${JARVIS_VC:-}" "$HOME/.local/bin/vc" "$(dirname "$(readlink -f "$0")")/vc"; do
+    [[ -n "$c" && -r "$c" ]] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
+model_name() {
+  local vc line
+  vc="$(find_vc)" || { printf 'unknown'; return 0; }
+  line="$(grep -m1 '^MODEL=' "$vc" 2>/dev/null || true)"
+  line="${line#MODEL=}"
+  line="${line#\"}"
+  line="${line%\"}"
+  printf '%s' "${line:-unknown}"
+}
+
+key_source() {
+  if [[ -n "${GOOGLE_GENERATIVE_AI_API_KEY:-}" ]]; then
+    printf 'env (this shell)'
+    return 0
+  fi
+  local file="${GEMINI_KEYS_FILE:-$HOME/.config/gemini/api-keys}"
+  local state="${GEMINI_KEY_STATE:-$HOME/.local/state/gemini-key/current}"
+  local idx=1 count=0
+  [[ -r "$file" ]] && count="$(grep -cvE '^[[:space:]]*(#|$)' "$file" 2>/dev/null || true)"
+  [[ -r "$state" ]] && read -r idx < "$state" || true
+  [[ "$idx" =~ ^[0-9]+$ ]] || idx=1
+  if (( count > 0 && idx >= 1 && idx <= count )); then
+    printf 'pool #%s/%s' "$idx" "$count"
+  else
+    printf 'missing'
+  fi
+}
+
+voxtype_state() {
+  local state=''
+  if need systemctl; then
+    state="$(systemctl --user is-active voxtype.service 2>/dev/null || true)"
+  fi
+  if [[ "$state" != "active" ]] && need voxtype; then
+    local status
+    status="$(voxtype status 2>/dev/null || true)"
+    case "${status,,}" in
+      *stopped*|*error*|*failed*|*"not running"*) state='inactive' ;;
+      '') : ;;
+      *) state='active' ;;
+    esac
+  fi
+  printf '%s' "${state:-unknown}"
+}
+
+request_state() {
+  local lock="$RUNTIME_DIR/request.lock"
+  local marker="$RUNTIME_DIR/transcribing"
+  if [[ -e "$marker" ]]; then
+    local age
+    age=$(( $(date +%s) - $(stat -c %Y "$marker" 2>/dev/null || echo 0) ))
+    if (( age >= 0 && age < 180 )); then
+      printf 'transcribing'
+      return 0
+    fi
+  fi
+  [[ -e "$lock" ]] || { printf 'idle'; return 0; }
+  need flock || { printf 'unknown'; return 0; }
+  if ( exec 9<"$lock"; flock -n 9 ) 2>/dev/null; then
+    printf 'idle'
+  else
+    printf 'answering'
+  fi
+}
+
+frame_count() {
+  local dir=''
+  [[ -r "$RUNTIME_DIR/current-framesdir" ]] && read -r dir < "$RUNTIME_DIR/current-framesdir" || true
+  if [[ -n "$dir" && -d "$dir" ]]; then
+    find "$dir" -maxdepth 1 -type f -name '*.jpg' -size +0c 2>/dev/null | wc -l
+  else
+    printf '0'
+  fi
+}
+
+human_age() {
+  local ts="$1" now diff
+  now="$(date +%s)"
+  diff=$(( now - ts ))
+  (( diff < 0 )) && diff=0
+  if (( diff < 60 )); then
+    printf '%ss ago' "$diff"
+  elif (( diff < 3600 )); then
+    printf '%sm ago' "$(( diff / 60 ))"
+  elif (( diff < 86400 )); then
+    printf '%sh ago' "$(( diff / 3600 ))"
+  else
+    printf '%sd ago' "$(( diff / 86400 ))"
+  fi
+}
+
+last_activity() {
+  if [[ -s "$HISTORY_FILE" ]]; then
+    human_age "$(stat -c %Y "$HISTORY_FILE")"
+  else
+    printf 'never'
+  fi
+}
+
+marker() { # value on-label off-label
+  if [[ "$1" == "1" ]]; then
+    printf '%s' "$2"
+  else
+    printf '%s' "$3"
+  fi
+}
+
+label() {
+  if [[ "$COLOR" == "1" ]]; then
+    printf '  \033[38;5;%sm%-16s\033[0m' "$PINK" "$1"
+  else
+    printf '  %-16s' "$1"
+  fi
+}
+
+value() { # value color
+  if [[ "$COLOR" == "1" ]]; then
+    printf '\033[38;5;%sm%s\033[0m\n' "$2" "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+row() { # label value color
+  label "$1"
+  value "$2" "$3"
+}
+
+history_lines() { # width
+  local width="$1"
+  if [[ ! -s "$HISTORY_FILE" ]]; then
+    if [[ "$COLOR" == "1" ]]; then
+      printf '  \033[38;5;%smno conversations yet\033[0m\n' "$GREY"
+    else
+      printf '  no conversations yet\n'
+    fi
+    return 0
+  fi
+  while IFS=$'\x1f' read -r q a; do
+    label 'You'
+    value "$q" "$GREY"
+    local w=$(( width - 10 ))
+    (( w < 20 )) && w=20
+    local -a wrapped=()
+    mapfile -t wrapped < <(printf '%s' "$a" | fold -s -w "$w")
+    local l
+    for l in "${wrapped[@]}"; do
+      printf '                  %s\n' "$l"
+    done
+    printf '\n'
+  done < <(awk '
+    function flush() { if (q != "") { sub(/[[:space:]]+$/, "", a); printf "%s\x1f%s\n", q, a } }
+    /^User: / { flush(); q = substr($0, 7); a = ""; next }
+    /^Assistant: / { a = substr($0, 12); next }
+    { if (a != "") a = a " " $0 }
+    END { flush() }
+  ' "$HISTORY_FILE" | tail -n "$TURNS")
+}
+
+render_frame() { # cols rows color
+  local cols="$1" rows="$2" color="$3"
+  COLOR="$color"
+  local vc_voice='off' ptt='idle' screen='off' frames voxtype request key
+  [[ -e "$RUNTIME_DIR/voice.enabled" ]] && vc_voice='on'
+  [[ -e "$RUNTIME_DIR/ptt.active" ]] && ptt='listening'
+  frames="$(frame_count)"
+  [[ -e "$RUNTIME_DIR/screen-down.active" ]] && screen="capturing ${frames} frame(s)"
+  voxtype="$(voxtype_state)"
+  request="$(request_state)"
+  key="$(key_source)"
+
+  if [[ "$color" == "1" ]]; then
+    gum style --border rounded --border-foreground "$PINK" --padding '0 2' --margin '0 0 0 2' \
+      'JARVIS' "$(gum style --foreground "$GREY" "status dashboard · $(model_name)")"
+    printf '\n'
+  else
+    printf 'JARVIS — status dashboard · %s\n\n' "$(model_name)"
+  fi
+
+  row 'Voice mode' "$(marker "$([[ "$vc_voice" == 'on' ]] && echo 1 || echo 0)" 'ON' 'off')" \
+    "$([[ "$vc_voice" == 'on' ]] && echo "$GREEN" || echo "$GREY")"
+  row 'Push-to-talk' "$(marker "$([[ "$ptt" == 'listening' ]] && echo 1 || echo 0)" 'listening' 'idle')" \
+    "$([[ "$ptt" == 'listening' ]] && echo "$GREEN" || echo "$GREY")"
+  row 'Screen capture' "$(marker "$([[ "$screen" == capturing* ]] && echo 1 || echo 0)" "$screen" 'off')" \
+    "$([[ "$screen" == capturing* ]] && echo "$GREEN" || echo "$GREY")"
+  row 'Voxtype' "$voxtype" "$([[ "$voxtype" == 'active' ]] && echo "$GREEN" || echo "$RED")"
+  row 'Request' "$request" "$([[ "$request" == 'idle' ]] && echo "$GREY" || echo "$PINK")"
+  row 'Model' "$(model_name)" "$GREY"
+  row 'API key' "$key" "$([[ "$key" == 'missing' ]] && echo "$RED" || echo "$GREY")"
+  row 'Last reply' "$(last_activity)" "$GREY"
+  printf '\n'
+
+  if [[ "$color" == "1" ]]; then
+    printf '  \033[38;5;%smRECENT CONVERSATION\033[0m\n\n' "$PINK"
+  else
+    printf '  RECENT CONVERSATION\n\n'
+  fi
+
+  local -a hist=()
+  mapfile -t hist < <(history_lines "$cols")
+  local max_lines=$(( rows - 18 ))
+  (( max_lines < 4 )) && max_lines=4
+  local start=$(( ${#hist[@]} - max_lines ))
+  (( start < 0 )) && start=0
+  local i
+  for (( i = start; i < ${#hist[@]}; i++ )); do
+    printf '%s\n' "${hist[i]}"
+  done
+
+  printf '\n'
+  if [[ "$color" == "1" ]]; then
+    gum style --foreground "$GREY" "  q quit · r refresh · auto ${REFRESH}s"
+  else
+    printf '  q quit · r refresh · auto %ss\n' "$REFRESH"
+  fi
+}
+
+once() {
+  local cols="${COLUMNS:-100}"
+  render_frame "$cols" 1000 0
+}
+
+main() {
+  need gum || die "gum is required (pacman -S gum)"
+  [[ -t 0 && -t 1 ]] || die "run in a terminal, or use --once"
+  need tput || die "tput is required (ncurses)"
+  COLOR=1
+  tput smcup 2>/dev/null || true
+  tput civis 2>/dev/null || true
+  cleanup() { tput cnorm 2>/dev/null || true; tput rmcup 2>/dev/null || true; }
+  trap cleanup EXIT
+  trap 'exit 0' INT TERM
+  local key
+  while :; do
+    local cols rows
+    cols="$(tput cols 2>/dev/null || echo 100)"
+    rows="$(tput lines 2>/dev/null || echo 40)"
+    tput cup 0 0 2>/dev/null || true
+    tput ed 2>/dev/null || true
+    render_frame "$cols" "$rows" 1
+    if read -rsn1 -t "$REFRESH" key; then
+      case "$key" in
+        q|Q) break ;;
+      esac
+    fi
+  done
+}
+
+while (( $# )); do
+  case "$1" in
+    --once) ONCE=1 ;;
+    --turns) shift; TURNS="${1:-6}" ;;
+    --refresh) shift; REFRESH="${1:-1}" ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1 (try --help)" ;;
+  esac
+  shift
+done
+
+[[ "$TURNS" =~ ^[0-9]+$ ]] || TURNS=6
+[[ "$REFRESH" =~ ^[0-9]+([.][0-9]+)?$ ]] || REFRESH=1
+
+if [[ "${ONCE:-0}" == "1" ]]; then
+  once
+else
+  main
+fi

@@ -28,7 +28,7 @@ latest commit on the default branch receives fixes.
          │
          ├──► grim + ffmpeg (local screenshot) ─────────────► frame(s)
          │
-         └──► OpenCode ──► OpenRouter API (cloud LLM) ◄──────┘
+         └──► OpenCode ──► Google Gemini API (cloud LLM) ◄───┘
                               │
                               ▼
                        spoken reply
@@ -36,7 +36,7 @@ latest commit on the default branch receives fixes.
                        Kokoro ONNX (local TTS) ──► ffplay (local audio)
 ```
 
-The only outbound network path is the **OpenCode → OpenRouter** hop. Everything
+The only outbound network path is the **OpenCode → Google Gemini** hop. Everything
 else runs locally.
 
 ---
@@ -44,7 +44,7 @@ else runs locally.
 ## What leaves your machine
 
 When you release push-to-talk (`vc ask`), the following are sent to
-**OpenRouter** (a third-party cloud API) via the `opencode run` call in
+**Google Gemini** (a third-party cloud API) via the `opencode run` call in
 `bin/vc`:
 
 1. **Your transcribed question** — the plain text Voxtype produced from your speech.
@@ -54,14 +54,13 @@ When you release push-to-talk (`vc ask`), the following are sent to
    `Right Shift` during a query), sent as `--file` attachments.
 4. **The system prompt** — a fixed, non-personal instruction string.
 
-The configured model is `openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`.
+The configured model is `google/gemini-3.5-flash`.
 
 > **Important:** speech transcripts and screen contents are sensitive. Because
 > they are sent to a cloud provider, Jarvis is **not** fully private/offline.
 > The local components are STT (Voxtype), TTS (Kokoro), and all storage — but
 > the reasoning step is remote. Treat anything you say on-mic or show on-screen
-> while attached as data shared with OpenRouter (and, transitively, the
-> underlying model provider).
+> while attached as data shared with Google Gemini.
 
 ### Machine access during reasoning
 
@@ -102,7 +101,7 @@ logged-in session can read them. Use full-disk encryption if that matters.
 
 | Endpoint | When | Purpose |
 |---|---|---|
-| OpenRouter API (`openrouter.ai`) | Every spoken query | LLM reasoning (cloud). |
+| Google Generative Language API (`generativelanguage.googleapis.com`) | Every spoken query | LLM reasoning (cloud). |
 | `github.com/thewh1teagle/kokoro-onnx` releases | Only during `jarvis-tts-setup` | Download Kokoro ONNX model + voice weights. |
 
 > Note: the `opencode` and `voxtype` binaries are third-party tools. Jarvis

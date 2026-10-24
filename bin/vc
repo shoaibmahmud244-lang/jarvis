@@ -7,14 +7,16 @@ RUNTIME_BASE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 RUNTIME_DIR="$RUNTIME_BASE/jarvis"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/jarvis"
 HISTORY_FILE="$DATA_DIR/conversation.txt"
-MODEL="openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+MODEL="google/gemini-3.5-flash"
+GEMINI_KEYS_FILE="${GEMINI_KEYS_FILE:-$HOME/.config/gemini/api-keys}"
+GEMINI_KEY_STATE="${GEMINI_KEY_STATE:-$HOME/.local/state/gemini-key/current}"
 
 mkdir -p "$RUNTIME_DIR" "$DATA_DIR"
 chmod 700 "$RUNTIME_DIR" "$DATA_DIR"
 if [[ -s "$RUNTIME_DIR/conversation.txt" && ! -s "$HISTORY_FILE" ]]; then
   mv -f "$RUNTIME_DIR/conversation.txt" "$HISTORY_FILE"
 fi
-touch "$HISTORY_FILE"
+[[ -e "$HISTORY_FILE" ]] || : > "$HISTORY_FILE"
 chmod 600 "$HISTORY_FILE"
 
 notify() {
@@ -245,6 +247,7 @@ ptt_down() {
   local transcript
   [[ -e "$RUNTIME_DIR/voice.enabled" ]] || return 0
   [[ ! -e "$RUNTIME_DIR/ptt.active" ]] || return 0
+  rm -f "$RUNTIME_DIR/transcribing"
   if ! voxtype_running; then
     notify "Jarvis voice mode unavailable" "Toggle voice mode off and on to restart Voxtype."
     return 1
@@ -314,7 +317,17 @@ ask() {
   cd "$RUNTIME_DIR"
   local engram_bin="${ENGRAM_BIN:-$HOME/.local/bin/engram}"
   local engram_dir="${ENGRAM_DATA_DIR:-$HOME/.engram}"
-  export OPENCODE_CONFIG_CONTENT="{\"\$schema\":\"https://opencode.ai/config.json\",\"mcp\":{\"engram\":{\"type\":\"local\",\"command\":[\"${engram_bin}\",\"mcp\",\"--tools=agent\",\"--project=jarvis\"],\"enabled\":true,\"environment\":{\"ENGRAM_DATA_DIR\":\"${engram_dir}\"}}},\"permission\":{\"engram_*\":\"allow\"}}"
+  export OPENCODE_CONFIG_CONTENT="{\"\$schema\":\"https://opencode.ai/config.json\",\"mcp\":{\"engram\":{\"type\":\"local\",\"command\":[\"${engram_bin}\",\"mcp\",\"--tools=agent\",\"--project=jarvis\"],\"enabled\":true,\"environment\":{\"ENGRAM_DATA_DIR\":\"${engram_dir}\"}},\"enola\":{\"enabled\":false}},\"permission\":{\"engram_*\":\"allow\"}}"
+  if [[ -z "${GOOGLE_GENERATIVE_AI_API_KEY:-}" && -r "$GEMINI_KEYS_FILE" ]]; then
+    local -a gemini_keys=()
+    local gemini_index=1
+    mapfile -t gemini_keys < <(grep -vE '^[[:space:]]*(#|$)' "$GEMINI_KEYS_FILE" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
+    [[ -r "$GEMINI_KEY_STATE" ]] && read -r gemini_index < "$GEMINI_KEY_STATE" || true
+    [[ "$gemini_index" =~ ^[0-9]+$ ]] || gemini_index=1
+    if (( gemini_index >= 1 && gemini_index <= ${#gemini_keys[@]} )); then
+      export GOOGLE_GENERATIVE_AI_API_KEY="${gemini_keys[$((gemini_index - 1))]}"
+    fi
+  fi
   local frame
   for frame in "${frames[@]}"; do
     [[ -s "$frame" ]] && files+=(--file "$frame")
@@ -371,12 +384,14 @@ ptt_up() {
 
   [[ -r "$RUNTIME_DIR/current-framesdir" ]] && read -r framesdir < "$RUNTIME_DIR/current-framesdir" || true
 
+  : > "$RUNTIME_DIR/transcribing"
   if ! voxtype record stop --wait --wait-file "$transcript" --json --timeout 120 > "$RUNTIME_DIR/transcription.json" 2> "$RUNTIME_DIR/transcription.err"; then
-    rm -f "$transcript" "$RUNTIME_DIR/transcription.json"
+    rm -f "$transcript" "$RUNTIME_DIR/transcription.json" "$RUNTIME_DIR/transcribing"
     clear_ptt_frames
     notify "Jarvis transcription failed" "Check $RUNTIME_DIR/transcription.err."
     return 1
   fi
+  rm -f "$RUNTIME_DIR/transcribing"
 
   if [[ -n "$framesdir" && -d "$framesdir" ]]; then
     mapfile -t frames < <(find "$framesdir" -maxdepth 1 -type f -name '*.jpg' -size +0c -print | sort)
@@ -398,7 +413,7 @@ ptt_up() {
 }
 
 cleanup() {
-  rm -f "$RUNTIME_DIR/share.enabled" "$RUNTIME_DIR/screen-down.active"
+  rm -f "$RUNTIME_DIR/share.enabled" "$RUNTIME_DIR/screen-down.active" "$RUNTIME_DIR/transcribing"
   if [[ -e "$RUNTIME_DIR/dictation.active" ]]; then
     voxtype record cancel >/dev/null 2>&1 || true
   fi
