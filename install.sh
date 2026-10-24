@@ -15,7 +15,6 @@ mkdir -p "$BIN_DIR" "$DATA_TTS_DIR" "$SYSTEMD_USER_DIR"
 # 2. Install binaries
 echo "-> Installing command line tools to $BIN_DIR..."
 install -m 755 "$SCRIPT_DIR/bin/vc" "$BIN_DIR/vc"
-install -m 755 "$SCRIPT_DIR/bin/jarvis-tui" "$BIN_DIR/jarvis-tui"
 install -m 755 "$SCRIPT_DIR/bin/jarvis-speak" "$BIN_DIR/jarvis-speak"
 install -m 755 "$SCRIPT_DIR/bin/jarvis-tts-setup" "$BIN_DIR/jarvis-tts-setup"
 
@@ -33,16 +32,9 @@ fi
 
 # 5. Check dependencies
 echo "-> Checking dependencies..."
-for cmd in uv voxtype grim ffmpeg ffplay opencode hyprctl; do
+for cmd in uv voxtype grim ffmpeg ffplay opencode hyprctl flock; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "   [WARNING] '$cmd' is not found in PATH. Please install it."
-  else
-    echo "   [OK] $cmd"
-  fi
-done
-for cmd in gum tput flock; do
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "   [WARNING] '$cmd' is not found in PATH (needed by jarvis-tui)."
   else
     echo "   [OK] $cmd"
   fi
