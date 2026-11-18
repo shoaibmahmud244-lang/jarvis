@@ -1,6 +1,6 @@
 # Jarvis — Real-Time Voice & Screen Multimodal Assistant
 
-A fast, lightweight, and multimodal voice assistant tailored for Linux (Wayland / Hyprland). Designed for immediate, high-value spoken responses with screen-awareness and persistent memory.
+A multimodal voice assistant tailored for Linux (Wayland / Hyprland) with push-to-talk activation and local CPU synthesis. Designed for immediate, high-value spoken responses with screen-awareness and persistent memory.
 
 ---
 
@@ -11,7 +11,7 @@ A fast, lightweight, and multimodal voice assistant tailored for Linux (Wayland 
   - **Single Capture:** Tap `Print` or `Right Shift` while speaking to attach a screenshot of your active monitor.
   - **Continuous Stream:** Hold `Print` or `Right Shift` to capture back-to-back frames (every 3 seconds) for dynamic on-screen workflows.
 - **High-Fidelity British Voice:** Uses [Kokoro ONNX](https://github.com/thewh1teagle/kokoro-onnx) (`bm_george` voice) on CPU with AVX2. Synthesizes ~10x–15x faster than real-time with zero resident RAM when idle.
-- **Persistent Memory:** Seamless context recall across sessions powered by [Engram](https://github.com) MCP integration.
+- **Persistent Memory:** Context recall across sessions powered by Engram MCP integration.
 - **On-Demand Speech Recognition:** Integrated with [Voxtype](https://voxtype.io) running as a shared systemd user daemon (~18MB idle memory, 0% CPU).
 
 ---
